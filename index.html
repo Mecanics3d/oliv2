@@ -1,0 +1,176 @@
+// =====================================================================
+//  BATEAU — pilotage Bluetooth + mesure U, I, P et maxima (Joy-IT SBC-DVA / INA236)
+//  Extension MakeCode requise : bluetooth (réglage « No Pairing Required »)
+//  Aucune extension pour le capteur : accès I²C directs, rien de caché.
+// =====================================================================
+
+// ===== RÉGLAGES — à ajuster par bateau au montage =====
+let BROCHE = AnalogPin.P0
+let MINI = 45        // butée bâbord réelle de la tringlerie
+let MAXI = 135       // butée tribord réelle
+let NEUTRE = 90
+let TIMEOUT = 800    // ms sans trame avant recentrage
+let VITESSE = 8      // degrés max par cycle -> 80°/s
+
+// ===== MESURE ÉLECTRIQUE =====
+let ADR_DVA = 0x41            // cavalier sur 0x41 : 0x40 est pris par le PCA9685 de la carte DFRobot
+let SHUNT_MOHM = 8            // shunt du SBC-DVA en milliohms (valeur de la librairie Joy-IT)
+let PERIODE_ENVOI = 200       // ms entre deux trames vers la page, soit 5 par seconde
+let PERIODE_ECHANTILLON = 5   // ms de pause entre deux lectures du capteur (maxima)
+let ETALON = 2048             // étalonnage INA236 : 1 pas de courant = 1 pas de tension shunt
+
+// ===== ÉTAT =====
+let consigne = NEUTRE
+let position = NEUTRE
+let dernierOrdre = 0
+let colonne = -9
+let connecte = false
+let capteurOk = false
+let mV = 0           // dernières valeurs instantanées
+let mA = 0
+let mW = 0
+let mVmax = 0        // maxima depuis la mise sous tension ou la dernière remise à zéro
+let mAmax = 0        // courant max en valeur absolue
+let mWmax = 0
+let nEch = 0         // lectures faites depuis la dernière trame envoyée
+let dernierControle = 0
+let dernierEnvoi = 0
+
+// ---------- matrice : colonne = position de barre, croix = plus d'ordre ----------
+function afficher(c: number) {
+    if (c == colonne) { return }
+    colonne = c
+    basic.clearScreen()
+    if (c < 0) {
+        basic.showIcon(IconNames.No, 0)
+        return
+    }
+    for (let y = 0; y <= 4; y++) { led.plot(c, y) }
+}
+
+// ---------- capteur INA236 ----------
+// Registres : 00 configuration, 01 tension shunt, 02 tension bus,
+//             03 puissance, 05 étalonnage, 3E identifiant fabricant
+function dvaEcrire(reg: number, valeur: number) {
+    let b = pins.createBuffer(3)
+    b.setNumber(NumberFormat.UInt8BE, 0, reg)
+    b.setNumber(NumberFormat.UInt16BE, 1, valeur)
+    pins.i2cWriteBuffer(ADR_DVA, b, false)
+}
+
+function dvaLire(reg: number, signe: boolean): number {
+    pins.i2cWriteNumber(ADR_DVA, reg, NumberFormat.UInt8BE, true)
+    if (signe) {
+        return pins.i2cReadNumber(ADR_DVA, NumberFormat.Int16BE, false)
+    }
+    return pins.i2cReadNumber(ADR_DVA, NumberFormat.UInt16BE, false)
+}
+
+function dvaDemarrer(): boolean {
+    // 0x5449 = « TI » : si autre chose revient, rien ne répond à cette adresse
+    if (dvaLire(0x3E, false) != 0x5449) { return false }
+    dvaEcrire(0x00, 0x8000)   // remise à zéro du composant
+    basic.pause(5)
+    // 0x4127 : mesure continue shunt + bus, 1,1 ms par conversion,
+    // UN SEUL échantillon par mesure = aucune moyenne, aucun lissage
+    dvaEcrire(0x00, 0x4127)
+    dvaEcrire(0x05, ETALON)   // sans étalonnage, le registre de puissance reste à zéro
+    basic.pause(10)           // laisse passer quelques conversions complètes
+    return dvaLire(0x05, false) == ETALON
+}
+
+// ---------- Bluetooth ----------
+bluetooth.onBluetoothConnected(function () {
+    connecte = true
+    consigne = NEUTRE
+    dernierOrdre = input.runningTime()
+})
+
+bluetooth.onBluetoothDisconnected(function () {
+    connecte = false
+    consigne = NEUTRE
+})
+
+bluetooth.onUartDataReceived(serial.delimiters(Delimiters.NewLine), function () {
+    let trame = bluetooth.uartReadUntil(serial.delimiters(Delimiters.NewLine))
+    if (trame.indexOf("R") >= 0) {   // « R » : la page demande la remise à zéro des maxima
+        mVmax = 0
+        mAmax = 0
+        mWmax = 0
+        return                       // ce n'est pas un ordre de barre : le chien de garde n'est pas rafraîchi
+    }
+    let v = parseFloat(trame)
+    if (!(v >= 0 && v <= 180)) { return }
+    consigne = Math.clamp(MINI, MAXI, Math.round(v))
+    dernierOrdre = input.runningTime()
+})
+
+bluetooth.startUartService()
+pins.servoWritePin(BROCHE, NEUTRE)
+afficher(-1)
+
+// ---------- boucle barre : chien de garde + limiteur de vitesse ----------
+basic.forever(function () {
+    if (input.runningTime() - dernierOrdre > TIMEOUT) {
+        consigne = NEUTRE
+        afficher(-1)
+    } else {
+        afficher(Math.clamp(0, 4, Math.round((consigne - MINI) * 4 / (MAXI - MINI))))
+    }
+    if (position < consigne) { position = Math.min(consigne, position + VITESSE) }
+    else if (position > consigne) { position = Math.max(consigne, position - VITESSE) }
+    pins.servoWritePin(BROCHE, position)
+    basic.pause(100)
+})
+
+// ---------- boucle lecture : aussi vite que possible, tient les maxima ----------
+// Elle ne fait jamais d'envoi Bluetooth : pendant qu'une trame part,
+// la lecture continue, et un pic ne peut pas tomber dans ce trou.
+basic.forever(function () {
+    if (!capteurOk) {
+        capteurOk = dvaDemarrer()
+        if (!capteurOk) {
+            basic.pause(PERIODE_ENVOI)
+            return
+        }
+    }
+    if (input.runningTime() - dernierControle >= 200) {
+        dernierControle = input.runningTime()
+        if (dvaLire(0x05, false) != ETALON) {   // fil débranché ou capteur réinitialisé
+            capteurOk = false
+            return
+        }
+    }
+    let u = Math.round(dvaLire(0x02, false) * 1.6)               // 1 pas = 1,6 mV
+    let i = Math.round(dvaLire(0x01, true) * 2.5 / SHUNT_MOHM)   // 2,5 µV par pas / R shunt
+    let p = Math.round(dvaLire(0x03, false) * 80 / SHUNT_MOHM)   // 32 × pas de courant
+    mV = u
+    mA = i
+    mW = p
+    if (u > mVmax) { mVmax = u }
+    if (Math.abs(i) > mAmax) { mAmax = Math.abs(i) }
+    if (p > mWmax) { mWmax = p }
+    nEch += 1
+    basic.pause(PERIODE_ECHANTILLON)
+})
+
+// ---------- boucle envoi : 5 trames par seconde vers la page ----------
+// Trame : M<mV>,<mA>,<mW>,<mV max>,<mA max>,<mW max>,<lectures/s>
+//         (ex. M3012,1250,3760,3105,4380,12940,148)   ou   E si capteur absent
+basic.forever(function () {
+    let maintenant = input.runningTime()
+    let cadence = 0
+    if (maintenant > dernierEnvoi) {
+        cadence = Math.round(nEch * 1000 / (maintenant - dernierEnvoi))
+    }
+    nEch = 0
+    dernierEnvoi = maintenant
+    if (connecte) {
+        if (capteurOk) {
+            bluetooth.uartWriteString("M" + mV + "," + mA + "," + mW + "," + mVmax + "," + mAmax + "," + mWmax + "," + cadence + "\n")
+        } else {
+            bluetooth.uartWriteString("E\n")
+        }
+    }
+    basic.pause(PERIODE_ENVOI)
+})
