@@ -1,179 +1,194 @@
 <!DOCTYPE html>
 <html lang="fr">
 <head>
-    // =====================================================================
-//  BATEAU — pilotage Bluetooth + mesure U, I, P et maxima (Joy-IT SBC-DVA / INA236)
-//  Extension MakeCode requise : bluetooth (réglage « No Pairing Required »)
-//  Aucune extension pour le capteur : accès I²C directs, rien de caché.
-// =====================================================================
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Bateau – barre et mesures</title>
+<style>
+  :root { --fond:#10161c; --carte:#1b242d; --texte:#e8eef3; --accent:#2f9bff; --ok:#3ecf74; --ko:#ff5a5a; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:12px; background:var(--fond); color:var(--texte);
+         font-family:-apple-system,Helvetica,Arial,sans-serif; }
+  h1 { font-size:20px; margin:4px 0 12px; }
+  .carte { background:var(--carte); border-radius:12px; padding:14px; margin-bottom:12px; }
+  button { font-size:18px; padding:14px; border:0; border-radius:10px; background:var(--accent);
+           color:#fff; width:100%; }
+  button:disabled { opacity:.4; }
+  button.gris { background:#3a4753; }
+  .ligne { display:flex; gap:10px; }
+  .ligne > * { flex:1; }
+  #etat { margin-top:8px; font-size:15px; }
+  #angle { font-size:48px; text-align:center; margin:6px 0; }
+  input[type=range] { width:100%; height:44px; }
+  table { width:100%; border-collapse:collapse; font-size:18px; }
+  th, td { padding:8px 4px; text-align:right; }
+  th:first-child, td:first-child { text-align:left; }
+  th { font-weight:normal; color:#9fb0bf; font-size:14px; }
+  #cadence { font-size:13px; color:#9fb0bf; margin-top:6px; }
+</style>
+</head>
+<body>
 
-// ===== RÉGLAGES — à ajuster par bateau au montage =====
-let BROCHE = AnalogPin.P0
-let MINI = 45        // butée bâbord réelle de la tringlerie
-let MAXI = 135       // butée tribord réelle
-let NEUTRE = 90
-let TIMEOUT = 800    // ms sans trame avant recentrage
-let VITESSE = 8      // degrés max par cycle -> 80°/s
+<h1>⛵ Bateau</h1>
 
-// ===== MESURE ÉLECTRIQUE =====
-let ADR_DVA = 0x41            // cavalier sur 0x41 : 0x40 est pris par le PCA9685 de la carte DFRobot
-let SHUNT_MOHM = 8            // shunt du SBC-DVA en milliohms (valeur de la librairie Joy-IT)
-let PERIODE_ENVOI = 200       // ms entre deux trames vers la page, soit 5 par seconde
-let PERIODE_ECHANTILLON = 5   // ms de pause entre deux lectures du capteur (maxima)
-let ETALON = 2048             // étalonnage INA236 : 1 pas de courant = 1 pas de tension shunt
+<div class="carte">
+  <button id="btnConnexion">Connecter la micro:bit</button>
+  <div id="etat">Non connecté</div>
+</div>
 
-// ===== ÉTAT =====
-let consigne = NEUTRE
-let position = NEUTRE
-let dernierOrdre = 0
-let colonne = -9
-let connecte = false
-let capteurOk = false
-let mV = 0           // dernières valeurs instantanées
-let mA = 0
-let mW = 0
-let mVmax = 0        // maxima depuis la mise sous tension ou la dernière remise à zéro
-let mAmax = 0        // courant max en valeur absolue
-let mWmax = 0
-let nEch = 0         // lectures faites depuis la dernière trame envoyée
-let dernierControle = 0
-let dernierEnvoi = 0
+<div class="carte">
+  <div id="angle">90°</div>
+  <input type="range" id="curseur" min="45" max="135" step="1" value="90" disabled>
+  <div class="ligne" style="margin-top:10px">
+    <button class="gris" id="btnGauche" disabled>◀ −5°</button>
+    <button class="gris" id="btnCentre" disabled>Centre</button>
+    <button class="gris" id="btnDroite" disabled>+5° ▶</button>
+  </div>
+</div>
 
-// ---------- matrice : colonne = position de barre, croix = plus d'ordre ----------
-function afficher(c: number) {
-    if (c == colonne) { return }
-    colonne = c
-    basic.clearScreen()
-    if (c < 0) {
-        basic.showIcon(IconNames.No, 0)
-        return
-    }
-    for (let y = 0; y <= 4; y++) { led.plot(c, y) }
+<div class="carte">
+  <table>
+    <tr><th></th><th>Instant</th><th>Maximum</th></tr>
+    <tr><td>Tension</td><td id="u">–</td><td id="umax">–</td></tr>
+    <tr><td>Courant</td><td id="i">–</td><td id="imax">–</td></tr>
+    <tr><td>Puissance</td><td id="p">–</td><td id="pmax">–</td></tr>
+  </table>
+  <div id="cadence"></div>
+  <button class="gris" id="btnRaz" style="margin-top:10px" disabled>Remettre les maxima à zéro</button>
+</div>
+
+<script>
+// ===== RÉGLAGES (à garder cohérents avec le programme micro:bit) =====
+const MINI = 45;      // butée bâbord
+const MAXI = 135;     // butée tribord
+const NEUTRE = 90;
+const PAS = 5;        // degrés par appui sur ◀ / ▶
+const PERIODE_ORDRE = 200;   // ms entre deux envois de la consigne (chien de garde micro:bit = 800 ms)
+
+// Service UART Bluetooth de la micro:bit
+const UART_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+const UART_RX      = '6e400002-b5a3-f393-e0a9-e50e24dcca9e'; // page -> micro:bit
+const UART_TX      = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // micro:bit -> page
+
+let appareil = null, caractRx = null, timer = null, tampon = '';
+let angle = NEUTRE;
+
+const $ = id => document.getElementById(id);
+const encodeur = new TextEncoder();
+const decodeur = new TextDecoder();
+
+function majAngle(v) {
+  angle = Math.max(MINI, Math.min(MAXI, Math.round(v)));
+  $('angle').textContent = angle + '°';
+  $('curseur').value = angle;
 }
 
-// ---------- capteur INA236 ----------
-// Registres : 00 configuration, 01 tension shunt, 02 tension bus,
-//             03 puissance, 05 étalonnage, 3E identifiant fabricant
-function dvaEcrire(reg: number, valeur: number) {
-    let b = pins.createBuffer(3)
-    b.setNumber(NumberFormat.UInt8BE, 0, reg)
-    b.setNumber(NumberFormat.UInt16BE, 1, valeur)
-    pins.i2cWriteBuffer(ADR_DVA, b, false)
+function activer(on) {
+  ['curseur','btnGauche','btnCentre','btnDroite','btnRaz'].forEach(id => $(id).disabled = !on);
 }
 
-function dvaLire(reg: number, signe: boolean): number {
-    pins.i2cWriteNumber(ADR_DVA, reg, NumberFormat.UInt8BE, true)
-    if (signe) {
-        return pins.i2cReadNumber(ADR_DVA, NumberFormat.Int16BE, false)
-    }
-    return pins.i2cReadNumber(ADR_DVA, NumberFormat.UInt16BE, false)
+function etat(texte, couleur) {
+  $('etat').textContent = texte;
+  $('etat').style.color = couleur || '';
 }
 
-function dvaDemarrer(): boolean {
-    // 0x5449 = « TI » : si autre chose revient, rien ne répond à cette adresse
-    if (dvaLire(0x3E, false) != 0x5449) { return false }
-    dvaEcrire(0x00, 0x8000)   // remise à zéro du composant
-    basic.pause(5)
-    // 0x4127 : mesure continue shunt + bus, 1,1 ms par conversion,
-    // UN SEUL échantillon par mesure = aucune moyenne, aucun lissage
-    dvaEcrire(0x00, 0x4127)
-    dvaEcrire(0x05, ETALON)   // sans étalonnage, le registre de puissance reste à zéro
-    basic.pause(10)           // laisse passer quelques conversions complètes
-    return dvaLire(0x05, false) == ETALON
+async function envoyer(texte) {
+  if (!caractRx) return;
+  const data = encodeur.encode(texte);
+  for (let i = 0; i < data.length; i += 20) {
+    const morceau = data.slice(i, i + 20);
+    if (caractRx.writeValueWithoutResponse) await caractRx.writeValueWithoutResponse(morceau);
+    else await caractRx.writeValue(morceau);
+  }
 }
 
-// ---------- Bluetooth ----------
-bluetooth.onBluetoothConnected(function () {
-    connecte = true
-    consigne = NEUTRE
-    dernierOrdre = input.runningTime()
-})
+let occupe = false;
+async function envoyerConsigne() {
+  if (occupe) return;
+  occupe = true;
+  try { await envoyer(angle + '\n'); } catch (e) { /* liaison perdue : gérée par l'événement de déconnexion */ }
+  occupe = false;
+}
 
-bluetooth.onBluetoothDisconnected(function () {
-    connecte = false
-    consigne = NEUTRE
-})
+function lireTrame(trame) {
+  trame = trame.trim();
+  if (trame === 'E') {
+    ['u','i','p','umax','imax','pmax'].forEach(id => $(id).textContent = '–');
+    $('cadence').textContent = 'Capteur de mesure non détecté';
+    return;
+  }
+  if (trame[0] !== 'M') return;
+  const v = trame.slice(1).split(',').map(Number);
+  if (v.length < 6 || v.some(isNaN)) return;
+  $('u').textContent    = (v[0] / 1000).toFixed(2) + ' V';
+  $('i').textContent    = (v[1] / 1000).toFixed(2) + ' A';
+  $('p').textContent    = (v[2] / 1000).toFixed(2) + ' W';
+  $('umax').textContent = (v[3] / 1000).toFixed(2) + ' V';
+  $('imax').textContent = (v[4] / 1000).toFixed(2) + ' A';
+  $('pmax').textContent = (v[5] / 1000).toFixed(2) + ' W';
+  if (v.length > 6) $('cadence').textContent = v[6] + ' lectures/s';
+}
 
-bluetooth.onUartDataReceived(serial.delimiters(Delimiters.NewLine), function () {
-    let trame = bluetooth.uartReadUntil(serial.delimiters(Delimiters.NewLine))
-    if (trame.indexOf("R") >= 0) {   // « R » : la page demande la remise à zéro des maxima
-        mVmax = 0
-        mAmax = 0
-        mWmax = 0
-        return                       // ce n'est pas un ordre de barre : le chien de garde n'est pas rafraîchi
-    }
-    let v = parseFloat(trame)
-    if (!(v >= 0 && v <= 180)) { return }
-    consigne = Math.clamp(MINI, MAXI, Math.round(v))
-    dernierOrdre = input.runningTime()
-})
+function surNotification(event) {
+  tampon += decodeur.decode(event.target.value);
+  let n;
+  while ((n = tampon.indexOf('\n')) >= 0) {
+    lireTrame(tampon.slice(0, n));
+    tampon = tampon.slice(n + 1);
+  }
+}
 
-bluetooth.startUartService()
-pins.servoWritePin(BROCHE, NEUTRE)
-afficher(-1)
+function surDeconnexion() {
+  clearInterval(timer);
+  caractRx = null;
+  activer(false);
+  etat('Déconnecté', 'var(--ko)');
+  $('btnConnexion').textContent = 'Connecter la micro:bit';
+}
 
-// ---------- boucle barre : chien de garde + limiteur de vitesse ----------
-basic.forever(function () {
-    if (input.runningTime() - dernierOrdre > TIMEOUT) {
-        consigne = NEUTRE
-        afficher(-1)
-    } else {
-        afficher(Math.clamp(0, 4, Math.round((consigne - MINI) * 4 / (MAXI - MINI))))
-    }
-    if (position < consigne) { position = Math.min(consigne, position + VITESSE) }
-    else if (position > consigne) { position = Math.max(consigne, position - VITESSE) }
-    pins.servoWritePin(BROCHE, position)
-    basic.pause(100)
-})
+async function connecter() {
+  if (!navigator.bluetooth) {
+    etat('Web Bluetooth indisponible : ouvrir cette page dans Bluefy', 'var(--ko)');
+    return;
+  }
+  try {
+    etat('Recherche…');
+    appareil = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: 'BBC micro:bit' }],
+      optionalServices: [UART_SERVICE]
+    });
+    appareil.addEventListener('gattserverdisconnected', surDeconnexion);
+    const serveur = await appareil.gatt.connect();
+    const service = await serveur.getPrimaryService(UART_SERVICE);
+    caractRx = await service.getCharacteristic(UART_RX);
+    const caractTx = await service.getCharacteristic(UART_TX);
+    await caractTx.startNotifications();
+    caractTx.addEventListener('characteristicvaluechanged', surNotification);
 
-// ---------- boucle lecture : aussi vite que possible, tient les maxima ----------
-// Elle ne fait jamais d'envoi Bluetooth : pendant qu'une trame part,
-// la lecture continue, et un pic ne peut pas tomber dans ce trou.
-basic.forever(function () {
-    if (!capteurOk) {
-        capteurOk = dvaDemarrer()
-        if (!capteurOk) {
-            basic.pause(PERIODE_ENVOI)
-            return
-        }
-    }
-    if (input.runningTime() - dernierControle >= 200) {
-        dernierControle = input.runningTime()
-        if (dvaLire(0x05, false) != ETALON) {   // fil débranché ou capteur réinitialisé
-            capteurOk = false
-            return
-        }
-    }
-    let u = Math.round(dvaLire(0x02, false) * 1.6)               // 1 pas = 1,6 mV
-    let i = Math.round(dvaLire(0x01, true) * 2.5 / SHUNT_MOHM)   // 2,5 µV par pas / R shunt
-    let p = Math.round(dvaLire(0x03, false) * 80 / SHUNT_MOHM)   // 32 × pas de courant
-    mV = u
-    mA = i
-    mW = p
-    if (u > mVmax) { mVmax = u }
-    if (Math.abs(i) > mAmax) { mAmax = Math.abs(i) }
-    if (p > mWmax) { mWmax = p }
-    nEch += 1
-    basic.pause(PERIODE_ECHANTILLON)
-})
+    tampon = '';
+    majAngle(NEUTRE);
+    activer(true);
+    etat('Connecté à ' + appareil.name, 'var(--ok)');
+    $('btnConnexion').textContent = 'Déconnecter';
+    timer = setInterval(envoyerConsigne, PERIODE_ORDRE);
+  } catch (e) {
+    etat('Échec : ' + e.message, 'var(--ko)');
+  }
+}
 
-// ---------- boucle envoi : 5 trames par seconde vers la page ----------
-// Trame : M<mV>,<mA>,<mW>,<mV max>,<mA max>,<mW max>,<lectures/s>
-//         (ex. M3012,1250,3760,3105,4380,12940,148)   ou   E si capteur absent
-basic.forever(function () {
-    let maintenant = input.runningTime()
-    let cadence = 0
-    if (maintenant > dernierEnvoi) {
-        cadence = Math.round(nEch * 1000 / (maintenant - dernierEnvoi))
-    }
-    nEch = 0
-    dernierEnvoi = maintenant
-    if (connecte) {
-        if (capteurOk) {
-            bluetooth.uartWriteString("M" + mV + "," + mA + "," + mW + "," + mVmax + "," + mAmax + "," + mWmax + "," + cadence + "\n")
-        } else {
-            bluetooth.uartWriteString("E\n")
-        }
-    }
-    basic.pause(PERIODE_ENVOI)
-})
+$('btnConnexion').addEventListener('click', () => {
+  if (appareil && appareil.gatt.connected) appareil.gatt.disconnect();
+  else connecter();
+});
+$('curseur').addEventListener('input', e => { majAngle(+e.target.value); envoyerConsigne(); });
+$('btnGauche').addEventListener('click', () => { majAngle(angle - PAS); envoyerConsigne(); });
+$('btnDroite').addEventListener('click', () => { majAngle(angle + PAS); envoyerConsigne(); });
+$('btnCentre').addEventListener('click', () => { majAngle(NEUTRE); envoyerConsigne(); });
+$('btnRaz').addEventListener('click', () => envoyer('R\n').catch(() => {}));
+
+$('curseur').min = MINI;
+$('curseur').max = MAXI;
+</script>
+</body>
+</html>
+
